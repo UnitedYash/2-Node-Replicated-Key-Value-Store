@@ -1,6 +1,5 @@
 #include <iostream>
 #include <string>
-#include <memory>
 #include <cstring>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -10,33 +9,54 @@
 
 constexpr int PORT = 8080;
 constexpr int BUFFER_SIZE = 1024;
+
 int main() {
     int sock = 0;
     struct sockaddr_in serv_addr;
     char buffer[BUFFER_SIZE] = {0};
-    // Creating socket file descriptor
+
+    // 1. Create socket
     if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        std::cerr << "Socket creation error" << std::endl;
+        std::cerr << "Socket creation error\n";
         return -1;
     }
+
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(PORT);
-    // Convert IPv4 and IPv6 addresses from text to binary form
+
+    // 2. Convert address
     if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr) <= 0) {
-        std::cerr << "Invalid address/ Address not supported" << std::endl;
+        std::cerr << "Invalid address\n";
         return -1;
     }
-    // Connect to the server
+
+    // 3. Connect ONCE
     if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-        std::cerr << "Connection Failed" << std::endl;
+        std::cerr << "Connection Failed\n";
         return -1;
     }
-    std::string hello = "Hello from client";
-    send(sock, hello.c_str(), hello.size(), 0);
-    std::cout << "Hello message sent" << std::endl;
-    ssize_t valread = read(sock, buffer, BUFFER_SIZE);
-    std::cout << "Received: " << buffer << std::endl;
-    // Close the socket
+
+    std::cout << "Connected to server.\n";
+
+    // 4. Send/receive loop
+    while (true) {
+        std::string msg;
+        std::cout << "Enter message: ";
+        std::cin >> msg;
+
+        send(sock, msg.c_str(), msg.size(), 0);
+
+        memset(buffer, 0, BUFFER_SIZE);
+        ssize_t bytes = read(sock, buffer, BUFFER_SIZE);
+        if (bytes <= 0) {
+            std::cout << "Server closed connection.\n";
+            break;
+        }
+
+        std::cout << "Received: " << buffer << std::endl;
+    }
+
+    // 5. Close
     close(sock);
     return 0;
 }
