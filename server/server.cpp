@@ -9,12 +9,32 @@
 constexpr int PORT = 8080;
 constexpr int BUFFER_SIZE = 1024;
 
+void handle_client(int new_socket, std::array<char, 1024> buffer) {
+
+    buffer.fill(0);
+    ssize_t valread = recv(new_socket, buffer.data(), buffer.size(), 0);
+
+    if (valread == 0) {
+        std::cout << "Client disconnected.\n";
+        return;
+    }
+    if (valread < 0) {
+        perror("read");
+        return;
+    }
+
+    std::cout << "Received: " << buffer.data() << std::endl;
+
+    // Echo back
+    send(new_socket, buffer.data(), valread, 0);
+}
+
 int main() {
     int server_fd, new_socket;
     struct sockaddr_in address;
     int opt = 1;
     socklen_t addrlen = sizeof(address);
-    char buffer[BUFFER_SIZE] = {0};
+    std::array<char, 1024> buffer;
 
     // 1. Create socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
@@ -37,7 +57,7 @@ int main() {
         perror("bind failed");
         exit(EXIT_FAILURE);
     }
-    
+
     // 4. Listen
     if (listen(server_fd, 3) < 0) {
         perror("listen");
@@ -58,22 +78,7 @@ int main() {
 
         // Handle this client until they disconnect
         while (true) {
-            memset(buffer, 0, BUFFER_SIZE);
-            ssize_t valread = read(new_socket, buffer, BUFFER_SIZE);
-
-            if (valread == 0) {
-                std::cout << "Client disconnected.\n";
-                break;
-            }
-            if (valread < 0) {
-                perror("read");
-                break;
-            }
-
-            std::cout << "Received: " << buffer << std::endl;
-
-            // Echo back
-            send(new_socket, buffer, valread, 0);
+            handle_client(new_socket, buffer);
         }
 
         close(new_socket);
