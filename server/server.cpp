@@ -9,9 +9,9 @@
 constexpr int PORT = 8080;
 
 
-bool handle_client(int new_socket, std::array<char, 1024>& buffer) {
-
-    ssize_t valread = recv(new_socket, buffer.data(), buffer.size(), 0);
+bool handle_client(int new_socket, std::string& buffer) {
+    char temp[1024];
+    ssize_t valread = recv(new_socket, temp, sizeof(temp), 0);
 
     if (valread <= 0) {
         if (valread == 0) std::cout << "Client disconnected.\n";
@@ -19,6 +19,21 @@ bool handle_client(int new_socket, std::array<char, 1024>& buffer) {
         close(new_socket); 
         return false;
     }
+
+    buffer.append(temp, valread);
+
+    size_t pos;
+    while ((pos = buffer.find('\n')) != std::string::npos) {
+        std::string line = buffer.substr(0, pos);
+        buffer.erase(0, pos + 1);
+
+        std::cout << "Command: " << line << std::endl;
+
+        // For now: echo back
+        std::string reply = line + "\n";
+        send(new_socket, reply.c_str(), reply.size(), 0);
+    }
+
 
 
     std::cout << "Received: " << std::string_view(buffer.data(), valread) << std::endl;
@@ -74,7 +89,7 @@ int main() {
 
         std::cout << "Client connected!\n";
         std::thread([new_socket]() {
-        std::array<char, 1024> buffer;
+        std::string buffer;
         while (handle_client(new_socket, buffer)) {
                 // keep serving this client
             }
