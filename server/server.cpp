@@ -25,8 +25,30 @@ void handle_put(int client_fd, const std::string& key, const std::string& value)
     send(client_fd, ok.c_str(), ok.size(), 0);
 }
 
+std::string read_exactly(int fd, int length, std::string& existing_buffer) {
+    std::string result;
+    if (!existing_buffer.empty()) {
+        size_t to_take = std::min((size_t)length, existing_buffer.size());
+        result.append(existing_buffer.substr(0, to_take));
+        existing_buffer.erase(0, to_take);
+    }
+
+    while (result.length() < (size_t)length) {
+        char temp[512];
+        size_t to_read = std::min(sizeof(temp), (size_t)length - result.size());
+        ssize_t bytes = recv(fd, temp, to_read, 0);
+        
+        if (bytes <= 0) return ""; // Handle disconnect
+        result.append(temp, bytes);
+    }
+
+    return result;
+}
+
 void handle_get(int client_fd, const std::string& key) {
+    
     std::string reply;
+
     
     // Use a block {} to limit the scope of the lock
     {
@@ -43,21 +65,23 @@ void handle_get(int client_fd, const std::string& key) {
     send(client_fd, reply.c_str(), reply.size(), 0);
 }
 
-void process_command(int client_fd, const std::string& line) {
+void process_command(int client_fd, const std::string& line, std::string& buffer) {
     std::istringstream iss(line);
     std::string cmd;
     iss >> cmd;
+    
 
     if (cmd == "PUT") {
-        std::string key, value;
-        iss >> key >> value;
-
-        if (key.empty() || value.empty()) {
+        std::string key;
+        size_t length;
+        iss >> key >> length;
+        std::cout << "put cmd" << std::endl;
+        if (key.empty()) {
             std::string err = "ERROR invalid PUT\n";
             send(client_fd, err.c_str(), err.size(), 0);
             return;
         }
-
+        std::string value = read_exactly(client_fd, length, buffer);
         handle_put(client_fd, key, value);
     }
     else if (cmd == "GET") {
@@ -94,7 +118,7 @@ bool handle_client(int new_socket, std::string& buffer) {
         std::string line = buffer.substr(0, pos);
         buffer.erase(0, pos + 1);
 
-        process_command(new_socket, line);
+        process_command(new_socket, line, buffer);
 
     }
     return true; 
