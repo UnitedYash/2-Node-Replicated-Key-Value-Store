@@ -5,28 +5,26 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
-
+#include <thread>
 constexpr int PORT = 8080;
-constexpr int BUFFER_SIZE = 1024;
 
-void handle_client(int new_socket, std::array<char, 1024> buffer) {
 
-    buffer.fill(0);
+bool handle_client(int new_socket, std::array<char, 1024>& buffer) {
+
     ssize_t valread = recv(new_socket, buffer.data(), buffer.size(), 0);
 
-    if (valread == 0) {
-        std::cout << "Client disconnected.\n";
-        return;
-    }
-    if (valread < 0) {
-        perror("read");
-        return;
+    if (valread <= 0) {
+        if (valread == 0) std::cout << "Client disconnected.\n";
+        else perror("recv error");
+        close(new_socket); 
+        return false;
     }
 
-    std::cout << "Received: " << buffer.data() << std::endl;
 
-    // Echo back
+    std::cout << "Received: " << std::string_view(buffer.data(), valread) << std::endl;
+
     send(new_socket, buffer.data(), valread, 0);
+    return true; 
 }
 
 int main() {
@@ -75,13 +73,12 @@ int main() {
         }
 
         std::cout << "Client connected!\n";
-
-        // Handle this client until they disconnect
-        while (true) {
-            handle_client(new_socket, buffer);
-        }
-
-        close(new_socket);
+        std::thread([new_socket]() {
+        std::array<char, 1024> buffer;
+        while (handle_client(new_socket, buffer)) {
+                // keep serving this client
+            }
+        }).detach();
     }
 
 
