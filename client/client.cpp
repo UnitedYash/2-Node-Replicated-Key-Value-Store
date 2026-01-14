@@ -42,7 +42,7 @@ int main() {
     while (true) {
         std::string msg;
         std::cout << "Enter message: ";
-        std::cin >> msg;
+        std::getline(std::cin, msg);
 
         send(sock, msg.c_str(), msg.size(), 0);
 

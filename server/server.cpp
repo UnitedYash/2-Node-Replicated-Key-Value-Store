@@ -37,7 +37,7 @@ int main() {
         perror("bind failed");
         exit(EXIT_FAILURE);
     }
-
+    
     // 4. Listen
     if (listen(server_fd, 3) < 0) {
         perror("listen");
