@@ -43,7 +43,8 @@ int main() {
         std::string msg;
         std::cout << "Enter message: ";
         std::getline(std::cin, msg);
-
+        
+        msg += "\n";
         send(sock, msg.c_str(), msg.size(), 0);
 
         memset(buffer, 0, BUFFER_SIZE);
