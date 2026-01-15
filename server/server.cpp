@@ -37,19 +37,17 @@ std::string read_exactly(int fd, int length, std::string& existing_buffer) {
     }
 
     while (result.length() < (size_t)length) {
-        std::cout << "res is less than th elength" << std::endl;
-        std::cout << "length is " << (size_t)length << std::endl;
 
         char temp[512];
         size_t to_read = std::min(sizeof(temp), (size_t)length - result.size());
-        std::cout << "result is " << result << std::endl;
+
 
         ssize_t bytes = recv(fd, temp, to_read, 0);
-        std::cout << "temp is " << temp << std::endl;
+
         
         if (bytes <= 0) return ""; // Handle disconnect
         result.append(temp, bytes);
-        std::cout << "result is " << result << std::endl;
+
     }
 
     return result;
