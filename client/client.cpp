@@ -44,11 +44,22 @@ int main() {
         std::cout << "Enter message: ";
         std::getline(std::cin, msg);
         
-        msg += "\n";
-        send(sock, msg.c_str(), msg.size(), 0);
+        if (msg.size() >= 3 && msg.substr(0, 3) == "PUT") {            
+            std::string body;
+            std::cout << "Enter body text: ";
+            std::getline(std::cin, body);
+            msg += "\n" + body;
+        }
+        else {
+            msg += "\n";
+        }
+        if (send(sock, msg.c_str(), msg.size(), 0) < 0) {
+            perror("send failed");
+            break;
+        }
 
         memset(buffer, 0, BUFFER_SIZE);
-        ssize_t bytes = read(sock, buffer, BUFFER_SIZE);
+        ssize_t bytes = read(sock, buffer, BUFFER_SIZE - 1); // -1 to keep space for null terminator
         if (bytes <= 0) {
             std::cout << "Server closed connection.\n";
             break;

@@ -26,20 +26,30 @@ void handle_put(int client_fd, const std::string& key, const std::string& value)
 }
 
 std::string read_exactly(int fd, int length, std::string& existing_buffer) {
+    std::cout << "read exact" << std::endl;
     std::string result;
     if (!existing_buffer.empty()) {
+        std::cout << "buffer is not empty" << std::endl;
         size_t to_take = std::min((size_t)length, existing_buffer.size());
+        std::cout << "result is " << result << std::endl;
         result.append(existing_buffer.substr(0, to_take));
         existing_buffer.erase(0, to_take);
     }
 
     while (result.length() < (size_t)length) {
+        std::cout << "res is less than th elength" << std::endl;
+        std::cout << "length is " << (size_t)length << std::endl;
+
         char temp[512];
         size_t to_read = std::min(sizeof(temp), (size_t)length - result.size());
+        std::cout << "result is " << result << std::endl;
+
         ssize_t bytes = recv(fd, temp, to_read, 0);
+        std::cout << "temp is " << temp << std::endl;
         
         if (bytes <= 0) return ""; // Handle disconnect
         result.append(temp, bytes);
+        std::cout << "result is " << result << std::endl;
     }
 
     return result;
@@ -82,6 +92,9 @@ void process_command(int client_fd, const std::string& line, std::string& buffer
             return;
         }
         std::string value = read_exactly(client_fd, length, buffer);
+        if (value.empty() && length > 0) {
+            std::cout << "empty read exact" << std::endl;
+        }
         handle_put(client_fd, key, value);
     }
     else if (cmd == "GET") {
