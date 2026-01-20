@@ -25,33 +25,36 @@ void handle_put(int client_fd, const std::string& key, const std::string& value)
     send(client_fd, ok.c_str(), ok.size(), 0);
 }
 
-std::string read_exactly(int fd, int length, std::string& existing_buffer) {
-    std::cout << "read exact" << std::endl;
+std::string read_exactly(int fd, size_t length,
+                         std::string& buffer) {
     std::string result;
-    if (!existing_buffer.empty()) {
-        std::cout << "buffer is not empty" << std::endl;
-        size_t to_take = std::min((size_t)length, existing_buffer.size());
-        std::cout << "result is " << result << std::endl;
-        result.append(existing_buffer.substr(0, to_take));
-        existing_buffer.erase(0, to_take);
-    }
 
-    while (result.length() < (size_t)length) {
+    // 1. Consume from existing buffer first
+    size_t take = std::min(length, buffer.size());
+    result.append(buffer, 0, take);
+    buffer.erase(0, take);
+    length -= take;
 
-        char temp[512];
-        size_t to_read = std::min(sizeof(temp), (size_t)length - result.size());
+    char temp[512];
 
+    // 2. Read remaining bytes from socket
+    while (length > 0) {
+        ssize_t bytes = recv(fd, temp, sizeof(temp), 0);
+        if (bytes <= 0) return "";
 
-        ssize_t bytes = recv(fd, temp, to_read, 0);
+        size_t used = std::min((size_t)bytes, length);
+        result.append(temp, used);
+        length -= used;
 
-        
-        if (bytes <= 0) return ""; // Handle disconnect
-        result.append(temp, bytes);
-
+        // 3. Save overflow back into buffer
+        if ((size_t)bytes > used) {
+            buffer.append(temp + used, bytes - used);
+        }
     }
 
     return result;
 }
+
 
 void handle_get(int client_fd, const std::string& key) {
     
