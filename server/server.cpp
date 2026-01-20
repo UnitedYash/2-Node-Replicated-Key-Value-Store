@@ -140,12 +140,22 @@ bool handle_client(int new_socket, std::string& buffer) {
     return true; 
 }
 
-int main() {
+int main(int argc, char* argv[]) {
     int server_fd, new_socket;
     struct sockaddr_in address;
     int opt = 1;
     socklen_t addrlen = sizeof(address);
     std::array<char, 1024> buffer;
+
+
+    //role of the server
+    enum class Role { PRIMARY, REPLICA };
+    Role role;
+    if (argv[0] == "PRIMARY") {
+        role = Role::PRIMARY;
+    } else {
+        role = Role::REPLICA;
+    }
 
     // 1. Create socket
     if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
