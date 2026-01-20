@@ -17,9 +17,11 @@ constexpr int PORT = 8080;
 
 void handle_put(int client_fd, const std::string& key, const std::string& value) {
     {
+        //get a lock to put the key
         std::lock_guard<std::mutex> lock(store_mutex);
         store[key] = value;
     }
+    //lock releases here
 
     std::string ok = "OK\n";
     send(client_fd, ok.c_str(), ok.size(), 0);
@@ -33,6 +35,7 @@ std::string read_exactly(int fd, size_t length,
     size_t take = std::min(length, buffer.size());
     result.append(buffer, 0, take);
     buffer.erase(0, take);
+    // remove the length left to read
     length -= take;
 
     char temp[512];
@@ -51,7 +54,6 @@ std::string read_exactly(int fd, size_t length,
             buffer.append(temp + used, bytes - used);
         }
     }
-
     return result;
 }
 
