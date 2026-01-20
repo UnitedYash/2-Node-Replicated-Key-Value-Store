@@ -80,13 +80,17 @@ void handle_get(int client_fd, const std::string& key) {
     send(client_fd, reply.c_str(), reply.size(), 0);
 }
 
-void process_command(int client_fd, const std::string& line, std::string& buffer) {
+void process_command(int client_fd, const std::string& line, std::string& buffer, Role role, int primary_fd = -1) {
     std::istringstream iss(line);
     std::string cmd;
     iss >> cmd;
     
 
     if (cmd == "PUT") {
+        if (role == Role::REPLICA && client_fd != primary_fd) {
+            send(client_fd, "ERROR replica is read-only\n", 27, 0);
+            return;
+        }
         std::string key;
         size_t length;
         iss >> key >> length;
@@ -103,6 +107,10 @@ void process_command(int client_fd, const std::string& line, std::string& buffer
         handle_put(client_fd, key, value);
     }
     else if (cmd == "GET") {
+        if (role == Role::REPLICA) {
+            send(client_fd, "ERROR replica does not allow GET's\n", 27, 0);
+            return;
+        }
         std::string key;
         iss >> key;
 
@@ -118,7 +126,7 @@ void process_command(int client_fd, const std::string& line, std::string& buffer
         send(client_fd, err.c_str(), err.size(), 0);
     }
 }
-bool handle_client(int new_socket, std::string& buffer) {
+bool handle_client(int new_socket, std::string& buffer, Role role, int primary_fd = -1) {
     char temp[1024];
     ssize_t valread = recv(new_socket, temp, sizeof(temp), 0);
 
@@ -136,7 +144,7 @@ bool handle_client(int new_socket, std::string& buffer) {
         std::string line = buffer.substr(0, pos);
         buffer.erase(0, pos + 1);
 
-        process_command(new_socket, line, buffer);
+        process_command(new_socket, line, buffer, role, primary_fd);
 
     }
     return true; 
@@ -204,7 +212,7 @@ void run_primary_server(int port) {
         std::cout << "Client connected!\n";
         std::thread([new_socket]() {
         std::string buffer;
-        while (handle_client(new_socket, buffer)) {
+        while (handle_client(new_socket, buffer, Role::PRIMARY)) {
                 // keep serving this client
             }
             close(new_socket);
@@ -260,7 +268,7 @@ void run_replica_server(int port) {
     std::cout << "Primary connected to replica\n";
 
     std::string buffer;
-    while (handle_client(primary_fd, buffer)) {}
+    while (handle_client(primary_fd, buffer, Role::REPLICA, primary_fd)) {}
 
     close(primary_fd);
     close(server_fd);
