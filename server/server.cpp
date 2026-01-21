@@ -4,6 +4,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sstream>
 #include <unistd.h>
 #include <thread>
@@ -17,17 +18,42 @@ constexpr int PORT = 8080;
 enum class Role { PRIMARY, REPLICA };
 
 
-void handle_put(int client_fd, const std::string& key, const std::string& value) {
+void handle_put(int client_fd,
+                const std::string& key,
+                const std::string& value,
+                Role role,
+                int replica_fd = -1) {
+    // 1. Store locally
     {
-        //get a lock to put the key
         std::lock_guard<std::mutex> lock(store_mutex);
         store[key] = value;
+        std::cout << "Stored key: " << key
+                  << " value: " << value << "\n";
     }
-    //lock releases here
 
-    std::string ok = "OK\n";
-    send(client_fd, ok.c_str(), ok.size(), 0);
+    // 2. Replicate ONLY if primary
+    if (role == Role::PRIMARY && replica_fd >= 0) {
+        std::ostringstream oss;
+        oss << "PUT " << key << " " << value.size()
+            << "\n" << value;
+        std::string cmd = oss.str();
+
+        ssize_t sent =
+            send(replica_fd, cmd.c_str(), cmd.size(), 0);
+
+        if (sent != (ssize_t)cmd.size()) {
+            std::cerr << "Warning: replication incomplete for "
+                      << key << "\n";
+        }
+    }
+
+    // 3. Reply ONLY if primary
+    if (role == Role::PRIMARY) {
+        send(client_fd, "OK\n", 3, 0);
+    }
 }
+
+
 
 std::string read_exactly(int fd, size_t length,
                          std::string& buffer) {
@@ -80,45 +106,53 @@ void handle_get(int client_fd, const std::string& key) {
     send(client_fd, reply.c_str(), reply.size(), 0);
 }
 
-void process_command(int client_fd, const std::string& line, std::string& buffer, Role role, int primary_fd = -1) {
+void process_command(int client_fd, const std::string& line,
+                     std::string& buffer, Role role, int replica_fd = -1) {
     std::istringstream iss(line);
     std::string cmd;
     iss >> cmd;
-    
 
     if (cmd == "PUT") {
-        if (role == Role::REPLICA && client_fd != primary_fd) {
+        // In replica mode, only accept PUTs from primary_fd (replication)
+        if (role == Role::REPLICA && client_fd != replica_fd) {
             send(client_fd, "ERROR replica is read-only\n", 27, 0);
             return;
         }
+
         std::string key;
         size_t length;
         iss >> key >> length;
-        std::cout << "put cmd" << std::endl;
+
         if (key.empty()) {
             std::string err = "ERROR invalid PUT\n";
             send(client_fd, err.c_str(), err.size(), 0);
             return;
         }
+
         std::string value = read_exactly(client_fd, length, buffer);
+
         if (value.empty() && length > 0) {
-            std::cout << "empty read exact" << std::endl;
+            std::cout << "Warning: empty read_exact for key " << key << "\n";
         }
-        handle_put(client_fd, key, value);
+        // Call handle_put with optional replication
+        handle_put(client_fd, key, value, role, replica_fd);
     }
     else if (cmd == "GET") {
+        // Replica does not allow GETs from clients
         if (role == Role::REPLICA) {
-            send(client_fd, "ERROR replica does not allow GET's\n", 27, 0);
+            send(client_fd, "ERROR replica does not allow GET's\n", 36, 0);
             return;
         }
+
         std::string key;
         iss >> key;
 
         if (key.empty()) {
-            std::string err = "ERROR invalid PUT\n";
+            std::string err = "ERROR invalid GET\n";
             send(client_fd, err.c_str(), err.size(), 0);
             return;
         }
+
         handle_get(client_fd, key);
     }
     else {
@@ -126,6 +160,24 @@ void process_command(int client_fd, const std::string& line, std::string& buffer
         send(client_fd, err.c_str(), err.size(), 0);
     }
 }
+
+
+int connect_to_replica(const std::string& host, int port) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("connect to replica failed");
+        return -1;
+    }
+    return sock;
+
+}
+
+
 bool handle_client(int new_socket, std::string& buffer, Role role, int primary_fd = -1) {
     char temp[1024];
     ssize_t valread = recv(new_socket, temp, sizeof(temp), 0);
@@ -167,6 +219,10 @@ Role parse_role(int argc, char* argv[]) {
     std::exit(1);
 }
 void run_primary_server(int port) {
+    int replica_fd = connect_to_replica("127.0.0.1", 9090);
+    if (replica_fd < 0) {
+        std::cerr << "Warning: running without replica\n";
+    }
     int server_fd, new_socket;
     struct sockaddr_in address;
     int opt = 1;
@@ -210,11 +266,10 @@ void run_primary_server(int port) {
         }
 
         std::cout << "Client connected!\n";
-        std::thread([new_socket]() {
-        std::string buffer;
-        while (handle_client(new_socket, buffer, Role::PRIMARY)) {
-                // keep serving this client
-            }
+        std::thread([new_socket, replica_fd]() {
+            std::string buffer;
+            while (handle_client(new_socket, buffer,
+                                Role::PRIMARY, replica_fd)) {}
             close(new_socket);
         }).detach();
     }
