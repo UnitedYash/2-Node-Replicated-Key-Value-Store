@@ -222,7 +222,10 @@ void run_primary_server(int port) {
     int replica_fd = connect_to_replica("127.0.0.1", 9090);
     if (replica_fd < 0) {
         std::cerr << "Warning: running without replica\n";
+    } else {
+        std::cout << "[PRIMARY] Connected to replica\n";
     }
+
     int server_fd, new_socket;
     struct sockaddr_in address;
     int opt = 1;
