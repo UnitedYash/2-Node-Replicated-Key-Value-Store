@@ -1,0 +1,7 @@
+kvserver
+kvclient
+a.out
+mainClient
+*.wal
+*.o
+.DS_Store

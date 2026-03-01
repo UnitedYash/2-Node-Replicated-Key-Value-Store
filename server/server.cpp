@@ -1,110 +1,156 @@
-#include <iostream>
-#include <string>
-#include <cstring>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <sstream>
-#include <unistd.h>
-#include <thread>
-#include <unordered_map>
-#include <mutex>
+#include "kv_store.h"
+#include "logger.h"
+#include "thread_pool.h"
+#include "wal.h"
 
-std::unordered_map<std::string, std::string> store;
-std::mutex store_mutex;
-constexpr int PORT = 8080;
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <string_view>
+
+// ── globals ───────────────────────────────────────────────────────────────────
+
+KVStore                        g_store;
+std::unique_ptr<WriteAheadLog> g_wal;
+
+constexpr int    PRIMARY_PORT     = 8080;
+constexpr int    REPLICA_PORT     = 9090;
+constexpr size_t THREAD_POOL_SIZE = 8;
 
 enum class Role { PRIMARY, REPLICA };
 
+// ── low-level helpers ─────────────────────────────────────────────────────────
 
-void handle_put(int client_fd,
-                const std::string& key,
-                const std::string& value,
-                Role role,
-                int replica_fd = -1) {
-    // 1. Store locally
-    {
-        std::lock_guard<std::mutex> lock(store_mutex);
-        store[key] = value;
-        std::cout << "Stored key: " << key
-                  << " value: " << value << "\n";
-    }
-
-    // 2. Replicate ONLY if primary
-    if (role == Role::PRIMARY && replica_fd >= 0) {
-        std::ostringstream oss;
-        oss << "PUT " << key << " " << value.size()
-            << "\n" << value;
-        std::string cmd = oss.str();
-
-        ssize_t sent =
-            send(replica_fd, cmd.c_str(), cmd.size(), 0);
-
-        if (sent != (ssize_t)cmd.size()) {
-            std::cerr << "Warning: replication incomplete for "
-                      << key << "\n";
-        }
-    }
-
-    // 3. Reply ONLY if primary
-    if (role == Role::PRIMARY) {
-        send(client_fd, "OK\n", 3, 0);
-    }
+void send_response(int fd, std::string_view msg) {
+    send(fd, msg.data(), msg.size(), 0);
 }
 
-
-
-std::string read_exactly(int fd, size_t length,
-                         std::string& buffer) {
+// Reads exactly `length` bytes from `fd`, using `buffer` as an overflow cache.
+[[nodiscard]] std::string read_exactly(int fd, size_t length, std::string& buffer) {
     std::string result;
 
-    // 1. Consume from existing buffer first
     size_t take = std::min(length, buffer.size());
     result.append(buffer, 0, take);
     buffer.erase(0, take);
-    // remove the length left to read
     length -= take;
 
-    char temp[512];
-
-    // 2. Read remaining bytes from socket
+    char tmp[512];
     while (length > 0) {
-        ssize_t bytes = recv(fd, temp, sizeof(temp), 0);
-        if (bytes <= 0) return "";
+        ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+        if (n <= 0) return {};
 
-        size_t used = std::min((size_t)bytes, length);
-        result.append(temp, used);
+        size_t used = std::min(static_cast<size_t>(n), length);
+        result.append(tmp, used);
         length -= used;
 
-        // 3. Save overflow back into buffer
-        if ((size_t)bytes > used) {
-            buffer.append(temp + used, bytes - used);
-        }
+        if (static_cast<size_t>(n) > used)
+            buffer.append(tmp + used, n - used);
     }
     return result;
 }
 
+// Creates, binds, and begins listening on `port`.  Exits on failure.
+[[nodiscard]] int create_server_socket(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { perror("socket"); exit(EXIT_FAILURE); }
+
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(port);
+
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        perror("bind"); exit(EXIT_FAILURE);
+    }
+    if (listen(fd, SOMAXCONN) < 0) {
+        perror("listen"); exit(EXIT_FAILURE);
+    }
+    return fd;
+}
+
+[[nodiscard]] int connect_to_replica(const std::string& host, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(port);
+    inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+
+    if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+// ── command handlers ──────────────────────────────────────────────────────────
+
+void handle_put(int client_fd, const std::string& key, const std::string& value,
+                Role role, int replica_fd = -1) {
+    if (g_wal) g_wal->log_put(key, value);
+    g_store.put(key, value);
+    Logger::info("PUT  key=" + key + "  bytes=" + std::to_string(value.size()));
+
+    if (role == Role::PRIMARY && replica_fd >= 0) {
+        std::ostringstream oss;
+        oss << "PUT " << key << " " << value.size() << "\n";
+        std::string header = oss.str();
+        send(replica_fd, header.c_str(), header.size(), 0);
+        send(replica_fd, value.data(),   value.size(),  0);
+    }
+
+    if (role == Role::PRIMARY) send_response(client_fd, "OK\n");
+}
 
 void handle_get(int client_fd, const std::string& key) {
-    
-    std::string reply;
-
-    
-    // Use a block {} to limit the scope of the lock
-    {
-        std::lock_guard<std::mutex> lock(store_mutex);
-        auto it = store.find(key);
-        if (it != store.end()) {
-            reply = it->second + "\n";
-        } else {
-            reply = "NOT_FOUND\n";
-        }
-    } // Lock is released here automatically
-
-    // Now send the data WITHOUT holding the lock
-    send(client_fd, reply.c_str(), reply.size(), 0);
+    Logger::info("GET  key=" + key);
+    if (auto val = g_store.get(key)) {
+        std::string reply = *val + "\n";
+        send_response(client_fd, reply);
+    } else {
+        send_response(client_fd, "NOT_FOUND\n");
+    }
 }
+
+void handle_delete(int client_fd, const std::string& key,
+                   Role role, int replica_fd = -1) {
+    if (g_wal) g_wal->log_delete(key);
+    bool found = g_store.remove(key);
+    Logger::info("DEL  key=" + key + (found ? "  (removed)" : "  (not found)"));
+
+    if (role == Role::PRIMARY && replica_fd >= 0) {
+        std::string cmd = "DEL " + key + "\n";
+        send(replica_fd, cmd.c_str(), cmd.size(), 0);
+    }
+
+    if (role == Role::PRIMARY)
+        send_response(client_fd, found ? "OK\n" : "NOT_FOUND\n");
+}
+
+void handle_stats(int client_fd) {
+    const auto& s = g_store.stats();
+    std::ostringstream oss;
+    oss << "puts="        << s.total_puts.load()
+        << " gets="       << s.total_gets.load()
+        << " deletes="    << s.total_deletes.load()
+        << " connections="<< s.active_connections.load()
+        << "\n";
+    send_response(client_fd, oss.str());
+}
+
+// ── protocol dispatcher ───────────────────────────────────────────────────────
 
 void process_command(int client_fd, const std::string& line,
                      std::string& buffer, Role role, int replica_fd = -1) {
@@ -113,238 +159,169 @@ void process_command(int client_fd, const std::string& line,
     iss >> cmd;
 
     if (cmd == "PUT") {
-        // In replica mode, only accept PUTs from primary_fd (replication)
         if (role == Role::REPLICA && client_fd != replica_fd) {
-            send(client_fd, "ERROR replica is read-only\n", 27, 0);
+            send_response(client_fd, "ERROR replica is read-only\n");
             return;
         }
-
         std::string key;
-        size_t length;
+        size_t length = 0;
         iss >> key >> length;
-
-        if (key.empty()) {
-            std::string err = "ERROR invalid PUT\n";
-            send(client_fd, err.c_str(), err.size(), 0);
-            return;
-        }
+        if (key.empty()) { send_response(client_fd, "ERROR invalid PUT\n"); return; }
 
         std::string value = read_exactly(client_fd, length, buffer);
+        if (value.empty() && length > 0)
+            Logger::warn("Empty value read for key: " + key);
 
-        if (value.empty() && length > 0) {
-            std::cout << "Warning: empty read_exact for key " << key << "\n";
-        }
-        // Call handle_put with optional replication
         handle_put(client_fd, key, value, role, replica_fd);
-    }
-    else if (cmd == "GET") {
-        // Replica does not allow GETs from clients
+
+    } else if (cmd == "GET") {
         if (role == Role::REPLICA) {
-            send(client_fd, "ERROR replica does not allow GET's\n", 36, 0);
+            send_response(client_fd, "ERROR replica does not serve GET\n");
             return;
         }
-
         std::string key;
         iss >> key;
-
-        if (key.empty()) {
-            std::string err = "ERROR invalid GET\n";
-            send(client_fd, err.c_str(), err.size(), 0);
-            return;
-        }
+        if (key.empty()) { send_response(client_fd, "ERROR invalid GET\n"); return; }
 
         handle_get(client_fd, key);
-    }
-    else {
-        std::string err = "ERROR unknown command\n";
-        send(client_fd, err.c_str(), err.size(), 0);
+
+    } else if (cmd == "DEL") {
+        if (role == Role::REPLICA && client_fd != replica_fd) {
+            send_response(client_fd, "ERROR replica is read-only\n");
+            return;
+        }
+        std::string key;
+        iss >> key;
+        if (key.empty()) { send_response(client_fd, "ERROR invalid DEL\n"); return; }
+
+        handle_delete(client_fd, key, role, replica_fd);
+
+    } else if (cmd == "STATS") {
+        handle_stats(client_fd);
+
+    } else if (!cmd.empty()) {
+        send_response(client_fd, "ERROR unknown command\n");
     }
 }
 
+// ── per-connection loop ───────────────────────────────────────────────────────
 
-int connect_to_replica(const std::string& host, int port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+// Reads one batch of data from `fd`, dispatches complete newline-delimited
+// commands, and returns false when the connection should be closed.
+// NOTE: the caller is responsible for closing `fd`.
+bool handle_client(int fd, std::string& buffer, Role role, int primary_fd = -1) {
+    char tmp[1024];
+    ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
 
-    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("connect to replica failed");
-        return -1;
-    }
-    return sock;
-
-}
-
-
-bool handle_client(int new_socket, std::string& buffer, Role role, int primary_fd = -1) {
-    char temp[1024];
-    ssize_t valread = recv(new_socket, temp, sizeof(temp), 0);
-
-    if (valread <= 0) {
-        if (valread == 0) std::cout << "Client disconnected.\n";
-        else perror("recv error");
-        close(new_socket); 
+    if (n <= 0) {
+        if (n == 0) Logger::info("Connection closed by peer");
+        else        Logger::error("recv: " + std::string(strerror(errno)));
         return false;
     }
 
-    buffer.append(temp, valread);
-    std::cout << "Buffer currently contains: [" << buffer << "]" << std::endl;
+    buffer.append(tmp, n);
+
     size_t pos;
     while ((pos = buffer.find('\n')) != std::string::npos) {
         std::string line = buffer.substr(0, pos);
         buffer.erase(0, pos + 1);
-
-        process_command(new_socket, line, buffer, role, primary_fd);
-
+        process_command(fd, line, buffer, role, primary_fd);
     }
-    return true; 
+    return true;
 }
 
-Role parse_role(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: server <primary|replica> <port>\n";
-        std::exit(1);
-    }
-    std::string role = argv[1];
-    if (role == "primary") {
-        return Role::PRIMARY;
-    }
-    if (role == "replica") {
-        return Role::REPLICA;
-    }
+// ── server runners ────────────────────────────────────────────────────────────
 
-    std::cerr << "Invalid role: " << role << "\n";
-    std::exit(1);
-}
-void run_primary_server(int port) {
-    int replica_fd = connect_to_replica("127.0.0.1", 9090);
-    if (replica_fd < 0) {
-        std::cerr << "Warning: running without replica\n";
-    } else {
-        std::cout << "[PRIMARY] Connected to replica\n";
+void run_primary_server(int port, bool with_replica = true) {
+    g_wal = std::make_unique<WriteAheadLog>("primary.wal");
+    g_wal->replay(
+        [](const std::string& k, const std::string& v) { g_store.restore(k, v); },
+        [](const std::string& k)                        { g_store.restore_remove(k); }
+    );
+    Logger::info("[PRIMARY] WAL replay complete");
+
+    int replica_fd = -1;
+    if (with_replica) {
+        replica_fd = connect_to_replica("127.0.0.1", REPLICA_PORT);
+        if (replica_fd < 0)
+            Logger::warn("[PRIMARY] Replica unreachable — running without replication");
+        else
+            Logger::info("[PRIMARY] Connected to replica on :" + std::to_string(REPLICA_PORT));
     }
 
-    int server_fd, new_socket;
-    struct sockaddr_in address;
-    int opt = 1;
-    socklen_t addrlen = sizeof(address);
+    int server_fd = create_server_socket(port);
+    Logger::info("[PRIMARY] Listening on :" + std::to_string(port));
 
-    // 1. Create socket
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
+    ThreadPool pool(THREAD_POOL_SIZE);
+    sockaddr_in addr{};
+    socklen_t   addrlen = sizeof(addr);
+
+    while (true) {
+        int client_fd = accept(server_fd, reinterpret_cast<sockaddr*>(&addr), &addrlen);
+        if (client_fd < 0) { perror("accept"); continue; }
+
+        Logger::info("[PRIMARY] Client connected");
+        g_store.on_connect();
+
+        pool.submit([client_fd, replica_fd] {
+            std::string buf;
+            while (handle_client(client_fd, buf, Role::PRIMARY, replica_fd)) {}
+            close(client_fd);
+            g_store.on_disconnect();
+            Logger::info("[PRIMARY] Client disconnected");
+        });
     }
-
-    // 2. Allow reuse of address
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
-
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
-
-     // 3. Bind
-    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // 4. Listen
-    if (listen(server_fd, SOMAXCONN) < 0) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
-
-    std::cout << "Server listening on port " << port << std::endl;
-
-    while (1) {
-        new_socket = accept(server_fd, (struct sockaddr*)&address, &addrlen);
-        if (new_socket < 0) {
-            perror("accept");
-            continue;
-        }
-
-        std::cout << "Client connected!\n";
-        std::thread([new_socket, replica_fd]() {
-            std::string buffer;
-            while (handle_client(new_socket, buffer,
-                                Role::PRIMARY, replica_fd)) {}
-            close(new_socket);
-        }).detach();
-    }
-
-    close(server_fd);
 }
 
 void run_replica_server(int port) {
-    int server_fd;
-    struct sockaddr_in address{};
-    int opt = 1;
-    socklen_t addrlen = sizeof(address);
+    g_wal = std::make_unique<WriteAheadLog>("replica.wal");
+    g_wal->replay(
+        [](const std::string& k, const std::string& v) { g_store.restore(k, v); },
+        [](const std::string& k)                        { g_store.restore_remove(k); }
+    );
+    Logger::info("[REPLICA] WAL replay complete");
 
-    // 1. Create socket
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
-    }
+    int server_fd = create_server_socket(port);
+    Logger::info("[REPLICA] Listening on :" + std::to_string(port));
 
-    // 2. Allow reuse of address
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        perror("setsockopt");
-        exit(EXIT_FAILURE);
-    }
-
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
-
-     // 3. Bind
-    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-
-    // 4. Listen
-    if (listen(server_fd, 1) < 0) {
-        perror("listen");
-        exit(EXIT_FAILURE);
-    }
-
-    std::cout << "Replica listening on port " << port << std::endl;
-
-    int primary_fd =
-        accept(server_fd, (struct sockaddr*)&address, &addrlen);
-    
-    if (primary_fd < 0) {
-        perror("accept");
-        exit(1);
-    }
-    std::cout << "Primary connected to replica\n";
+    sockaddr_in addr{};
+    socklen_t   addrlen = sizeof(addr);
+    int primary_fd = accept(server_fd, reinterpret_cast<sockaddr*>(&addr), &addrlen);
+    if (primary_fd < 0) { perror("accept"); exit(EXIT_FAILURE); }
+    Logger::info("[REPLICA] Primary connected");
 
     std::string buffer;
     while (handle_client(primary_fd, buffer, Role::REPLICA, primary_fd)) {}
 
     close(primary_fd);
     close(server_fd);
-}
-int main(int argc, char* argv[]) {
 
-    Role role = parse_role(argc, argv);
+    Logger::info("[REPLICA] Primary disconnected — promoting to PRIMARY on :" +
+                 std::to_string(PRIMARY_PORT));
+    run_primary_server(PRIMARY_PORT, /*with_replica=*/false);
+}
+
+// ── entry point ───────────────────────────────────────────────────────────────
+
+[[nodiscard]] Role parse_role(std::string_view arg) {
+    if (arg == "primary") return Role::PRIMARY;
+    if (arg == "replica") return Role::REPLICA;
+    std::cerr << "Invalid role '" << arg << "'. Use 'primary' or 'replica'.\n";
+    exit(EXIT_FAILURE);
+}
+
+int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "Usage: server <primary|replica> <port>\n";
-        return 1;
+        std::cerr << "Usage: " << argv[0] << " <primary|replica> <port>\n";
+        return EXIT_FAILURE;
     }
 
-    int port = std::stoi(argv[2]);
+    Role role = parse_role(argv[1]);
+    int  port = std::stoi(argv[2]);
 
     if (role == Role::PRIMARY) {
         run_primary_server(port);
     } else {
         run_replica_server(port);
     }
-    return 0;
 }
