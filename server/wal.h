@@ -2,6 +2,7 @@
 
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <sstream>
 #include <string>
 
@@ -21,6 +22,7 @@ public:
     [[nodiscard]] bool is_open() const { return file_.is_open(); }
 
     void log_put(const std::string& key, const std::string& value) {
+        std::lock_guard<std::mutex> lock(mutex_);
         file_ << "PUT " << key << " " << value.size() << "\n";
         file_.write(value.data(), static_cast<std::streamsize>(value.size()));
         file_ << "\n";
@@ -28,6 +30,7 @@ public:
     }
 
     void log_delete(const std::string& key) {
+        std::lock_guard<std::mutex> lock(mutex_);
         file_ << "DEL " << key << "\n";
         file_.flush();
     }
@@ -68,4 +71,5 @@ public:
 private:
     std::string   path_;
     std::ofstream file_;
+    mutable std::mutex mutex_;
 };
